@@ -1,0 +1,164 @@
+name: FluidSynth XP
+
+# Compila o FluidSynth para Windows XP (32 bits) sempre que o repositorio
+# original publica uma release (so releases: sem pre-releases, drafts ou commits).
+# O GitHub nao permite disparar uma Action por eventos de outro repositorio,
+# por isso consulta-se a API de 6 em 6 horas.
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag upstream a compilar (vazio = ultima release)"
+        required: false
+        default: ""
+      force:
+        description: "Recompilar mesmo que a release ja exista (substitui-a)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fluidsynth-xp
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: FluidSynth/fluidsynth
+
+jobs:
+  check:
+    name: Verificar release upstream
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.up.outputs.tag }}
+      build: ${{ steps.up.outputs.build }}
+    steps:
+      - id: up
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_TAG" ]; then
+            [[ "$INPUT_TAG" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::tag invalida: $INPUT_TAG"; exit 1; }
+            tag="$INPUT_TAG"
+            skip=$(gh api "repos/$UPSTREAM/releases/tags/$tag" --jq '.prerelease or .draft') \
+              || { echo "::error::$tag nao e uma release publicada em $UPSTREAM"; exit 1; }
+            [ "$skip" = false ] || { echo "::error::$tag e pre-release/draft"; exit 1; }
+          else
+            tag=$(gh api "repos/$UPSTREAM/releases/latest" --jq '.tag_name')
+          fi
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && [ "$FORCE" != "true" ]; then
+            build=false
+            echo "Release $tag ja existe em $GITHUB_REPOSITORY; nada a fazer."
+          else
+            build=true
+            echo "A compilar $tag."
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Compilar (${{ matrix.variant }})
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        variant: [prescott, generic]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar dependencias
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-mingw-w64-i686-posix g++-mingw-w64-i686-posix binutils-mingw-w64-i686 \
+            mingw-w64-i686-dev cmake make git curl ca-certificates xz-utils zip
+
+      - name: Compilar
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+          VARIANT: ${{ matrix.variant }}
+        run: bash ./build-fluidsynth-xp.sh --tag "$TAG" --variant "$VARIANT" --zip
+
+      - name: Guardar pacote
+        uses: actions/upload-artifact@v4
+        with:
+          name: xp_${{ matrix.variant }}
+          path: build/release/*.zip
+          if-no-files-found: error
+
+      - name: Guardar logs (falha)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs_${{ matrix.variant }}
+          path: build/logs
+          if-no-files-found: ignore
+
+  release:
+    name: Publicar release
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: xp_*
+          path: dist
+          merge-multiple: true
+
+      - name: Criar release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$UPSTREAM/releases/tags/$TAG" > up.json
+          name=$(jq -r '.name // empty' up.json); [ -n "$name" ] || name="$TAG"
+          url=$(jq -r '.html_url' up.json)
+          published=$(jq -r '.published_at' up.json)
+          author=$(jq -r '.author.login // "desconhecido"' up.json)
+          commit=$(jq -r '.target_commitish' up.json)
+
+          # Corpo herdado do original; "#123" passa a apontar para o repo original
+          jq -r '.body // ""' up.json \
+            | sed -E "s@(^|[^A-Za-z0-9/&])#([0-9]+)@\1${UPSTREAM}#\2@g" > body.md
+
+          {
+            echo "> **Build nao oficial para Windows XP (32 bits)** da release [\`${TAG}\`](${url}) de \`${UPSTREAM}\`."
+            echo "> Publicada no original em ${published} por @${author} (ref. \`${commit}\`)."
+            echo ">"
+            echo "> | Ficheiro | Optimizacao |"
+            echo "> |---|---|"
+            echo "> | \`fluidsynth-${TAG}-xp_prescott.zip\` | Pentium 4 Prescott (\`-march=prescott\`, SSE3) |"
+            echo "> | \`fluidsynth-${TAG}-xp_generic.zip\` | generica (\`-march=i686\`, sem SSE) |"
+            echo ">"
+            echo "> Executavel estatico (libsndfile, Ogg/Vorbis/FLAC/Opus incluidos; suporta .sf3). Drivers: dsound, waveout, winmidi."
+            echo ""
+            echo "---"
+            echo ""
+            cat body.md
+          } > notes.md
+
+          (cd dist && sha256sum ./*.zip | sed 's| \./| |' > SHA256SUMS && cat SHA256SUMS)
+
+          if [ "${FORCE:-}" = "true" ]; then
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          fi
+
+          latest_up=$(gh api "repos/$UPSTREAM/releases/latest" --jq '.tag_name')
+          if [ "$TAG" = "$latest_up" ]; then latest=true; else latest=false; fi
+
+          gh release create "$TAG" dist/*.zip dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$name" \
+            --notes-file notes.md \
+            --latest="$latest"
